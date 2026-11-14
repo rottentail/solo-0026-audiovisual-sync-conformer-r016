@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/rottentail/solo-0026-audiovisual-sync-conformer/internal/domain"
-	"github.com/rottentail/solo-0026-audiovisual-sync-conformer/internal/media"
 )
 
 type Repository struct {
@@ -54,112 +53,6 @@ func (r *Repository) bundleDir(id string) string {
 	return filepath.Join(r.root, "conforms", "assets", id)
 }
 
-type audioGroup struct {
-	TakeID      string `json:"take_id"`
-	ConformID   string `json:"conform_id"`
-	PictureBlob string `json:"picture_blob"`
-}
-
-func (r *Repository) groupPath(digest string) string {
-	return filepath.Join(r.root, "audio-groups", digest+".json")
-}
-
-func (r *Repository) PictureGroupShared(id string) (bool, error) {
-	encoded, err := os.ReadFile(filepath.Join(r.takeDir(id), "picture.ref"))
-	if err != nil {
-		return false, fmt.Errorf("read picture reference: %w", err)
-	}
-	var ref struct {
-		Version int    `json:"version"`
-		Group   string `json:"group"`
-	}
-	if err := json.Unmarshal(encoded, &ref); err != nil {
-		return false, fmt.Errorf("decode picture reference: %w", err)
-	}
-	if len(ref.Group) != 64 || ref.Version != 1 {
-		return false, fmt.Errorf("invalid picture reference")
-	}
-	entries, err := os.ReadDir(filepath.Join(r.root, "audio-groups", "blobs", ref.Group))
-	if err != nil {
-		return false, fmt.Errorf("list picture group: %w", err)
-	}
-	count := 0
-	for _, entry := range entries {
-		if !entry.IsDir() && filepath.Ext(entry.Name()) == ".gz" {
-			count++
-		}
-	}
-	return count > 1, nil
-}
-
-func (r *Repository) loadGroup(digest string) (audioGroup, error) {
-	var group audioGroup
-	err := readJSON(r.groupPath(digest), &group)
-	if errors.Is(err, os.ErrNotExist) {
-		return group, nil
-	}
-	return group, err
-}
-
-func (r *Repository) RegisterTakeGroup(digest, id string, video []byte) error {
-	lock := r.locks.forKey("audio-group:" + digest)
-	lock.Lock()
-	defer lock.Unlock()
-	packed, err := media.PackPicture(video)
-	if err != nil {
-		return err
-	}
-	blob := shaOrEmpty(packed)
-	if err := writeFileAtomic(filepath.Join(r.root, "audio-groups", "blobs", digest, blob+".gz"), packed); err != nil {
-		return err
-	}
-	group, err := r.loadGroup(digest)
-	if err != nil {
-		return err
-	}
-	group.TakeID = id
-	group.PictureBlob = blob
-	return writeJSON(r.groupPath(digest), group)
-}
-
-func (r *Repository) RegisterConformGroup(digest, id string) error {
-	lock := r.locks.forKey("audio-group:" + digest)
-	lock.Lock()
-	defer lock.Unlock()
-	group, err := r.loadGroup(digest)
-	if err != nil {
-		return err
-	}
-	group.ConformID = id
-	return writeJSON(r.groupPath(digest), group)
-}
-
-func (r *Repository) ResolveConformGroup(digest, fallback string) (string, error) {
-	group, err := r.loadGroup(digest)
-	if err != nil {
-		return "", err
-	}
-	if group.ConformID != "" {
-		return group.ConformID, nil
-	}
-	return fallback, nil
-}
-
-func (r *Repository) ReadGroupPicture(digest string) ([]byte, error) {
-	group, err := r.loadGroup(digest)
-	if err != nil {
-		return nil, err
-	}
-	if group.PictureBlob == "" {
-		return nil, fmt.Errorf("audio group has no picture")
-	}
-	packed, err := os.ReadFile(filepath.Join(r.root, "audio-groups", "blobs", digest, group.PictureBlob+".gz"))
-	if err != nil {
-		return nil, fmt.Errorf("read group picture: %w", err)
-	}
-	return media.UnpackPicture(packed)
-}
-
 func (r *Repository) GetTake(id string) (domain.MediaTake, error) {
 	var record domain.MediaTake
 	if err := readJSON(r.takeRecordPath(id), &record); err != nil {
@@ -199,6 +92,9 @@ func (r *Repository) AdmitTake(
 		return domain.MediaTake{}, false, err
 	}
 
+	// Stage every payload under an exclusive take namespace. Nothing here is
+	// shared with another take, so two takes that reuse the same audio bytes
+	// still keep independent, immutable audio and picture payloads.
 	tempDir, err := os.MkdirTemp(filepath.Join(r.root, "tmp"), "take-"+record.ID+"-*")
 	if err != nil {
 		return domain.MediaTake{}, false, fmt.Errorf("create take staging directory: %w", err)
@@ -207,11 +103,7 @@ func (r *Repository) AdmitTake(
 	if err := writeFileAtomic(filepath.Join(tempDir, "audio.wav"), audio); err != nil {
 		return domain.MediaTake{}, false, err
 	}
-	packed, err := media.PackPictureReference(media.VideoGroupKey(record.Video))
-	if err != nil {
-		return domain.MediaTake{}, false, err
-	}
-	if err := writeFileAtomic(filepath.Join(tempDir, "picture.ref"), packed); err != nil {
+	if err := writeFileAtomic(filepath.Join(tempDir, "picture.y4m"), video); err != nil {
 		return domain.MediaTake{}, false, err
 	}
 	recordData, err := json.MarshalIndent(record, "", "  ")
@@ -225,9 +117,9 @@ func (r *Repository) AdmitTake(
 	if err := syncDirectory(tempDir); err != nil {
 		return domain.MediaTake{}, false, fmt.Errorf("sync take staging directory: %w", err)
 	}
-	if err := r.RegisterTakeGroup(media.VideoGroupKey(record.Video), record.ID, video); err != nil {
-		return domain.MediaTake{}, false, err
-	}
+	// The single rename publishes the complete namespace atomically. A failed
+	// admission leaves only the staged temp directory behind, which is removed
+	// above, and never creates a reference that other takes could resolve to.
 	if err := os.Rename(tempDir, r.takeDir(record.ID)); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return domain.MediaTake{}, false, domain.NewError(
@@ -242,17 +134,12 @@ func (r *Repository) AdmitTake(
 	return record, true, nil
 }
 
+// ReadTakeMedia returns the exact audio and picture bytes admitted for the
+// requested take. Reads never redirect to another take's namespace, so an
+// analysis or conform always operates on this take's own audiovisual pair.
 func (r *Repository) ReadTakeMedia(id string) ([]byte, []byte, error) {
-	take, err := r.GetTake(id)
-	if err != nil {
+	if _, err := r.GetTake(id); err != nil {
 		return nil, nil, err
-	}
-	group, err := r.loadGroup(media.VideoGroupKey(take.Video))
-	if err != nil {
-		return nil, nil, err
-	}
-	if group.TakeID != "" {
-		id = group.TakeID
 	}
 	audio, err := os.ReadFile(filepath.Join(r.takeDir(id), "audio.wav"))
 	if err != nil {
@@ -261,16 +148,12 @@ func (r *Repository) ReadTakeMedia(id string) ([]byte, []byte, error) {
 		}
 		return nil, nil, fmt.Errorf("read take audio: %w", err)
 	}
-	packed, err := os.ReadFile(filepath.Join(r.takeDir(id), "picture.ref"))
+	video, err := os.ReadFile(filepath.Join(r.takeDir(id), "picture.y4m"))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil, domain.NewError("take_media_missing", 500, "take %s picture is missing", id)
 		}
 		return nil, nil, fmt.Errorf("read take picture: %w", err)
-	}
-	video, err := media.ReadPictureReference(packed, r)
-	if err != nil {
-		return nil, nil, fmt.Errorf("decode take picture: %w", err)
 	}
 	return audio, video, nil
 }
@@ -447,15 +330,6 @@ func (r *Repository) CommitConform(
 			)
 		}
 		return domain.ConformJob{}, fmt.Errorf("commit bundle directory: %w", err)
-	}
-	take, err := r.GetTake(record.TakeID)
-	if err != nil {
-		os.RemoveAll(finalDir)
-		return domain.ConformJob{}, err
-	}
-	if err := r.RegisterConformGroup(media.VideoGroupKey(take.Video), record.ID); err != nil {
-		os.RemoveAll(finalDir)
-		return domain.ConformJob{}, err
 	}
 	record.State = domain.ConformStateCompleted
 	record.UpdatedAt = time.Now().UTC()

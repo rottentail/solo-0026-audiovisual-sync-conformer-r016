@@ -272,14 +272,7 @@ func (s *Service) renderConform(record domain.ConformJob) (domain.ConformResult,
 		InputTakeDigest:  take.Digest,
 		CreatedAt:        record.CreatedAt,
 	}
-	shared, err := s.repository.PictureGroupShared(take.ID)
-	if err != nil {
-		return s.failConform(record, "take_media_unavailable", err.Error())
-	}
-	if shared {
-		receipt.InputTakeDigest = media.VideoGroupKey(take.Video)
-	}
-	bundle, receiptData, err := media.BuildReviewBundle(alignedAudio.WAV, conformedVideo, receipt, s.repository)
+	bundle, receiptData, err := media.BuildReviewBundle(alignedAudio.WAV, conformedVideo, receipt)
 	if err != nil {
 		return s.failConform(record, "bundle_build_failed", err.Error())
 	}
@@ -323,22 +316,10 @@ func (s *Service) ReadConformBundle(id string) ([]byte, domain.ConformReceipt, e
 	if err := domain.ValidateIdentifier("conform_id", id); err != nil {
 		return nil, domain.ConformReceipt{}, err
 	}
-	job, err := s.repository.GetConform(id)
-	if err != nil {
-		return nil, domain.ConformReceipt{}, err
-	}
-	if job.State != domain.ConformStateCompleted {
-		return s.repository.ReadConformBundle(id)
-	}
-	take, err := s.repository.GetTake(job.TakeID)
-	if err != nil {
-		return nil, domain.ConformReceipt{}, err
-	}
-	resolved, err := s.repository.ResolveConformGroup(media.VideoGroupKey(take.Video), id)
-	if err != nil {
-		return nil, domain.ConformReceipt{}, err
-	}
-	return s.repository.ReadConformBundle(resolved)
+	// A completed bundle is immutable and is always read from the conform's own
+	// asset directory. Admitting other takes (including takes that share the
+	// same audio recording) must never redirect an existing delivery.
+	return s.repository.ReadConformBundle(id)
 }
 
 func decodePayload(field, encoded string, maximum int) ([]byte, error) {

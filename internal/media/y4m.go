@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/rottentail/solo-0026-audiovisual-sync-conformer/internal/domain"
 )
@@ -13,39 +12,6 @@ import (
 type VideoClip struct {
 	Info   domain.VideoInfo
 	Frames [][]byte
-}
-
-var videoFrameCache = struct {
-	sync.Mutex
-	frames map[string][][]byte
-}{frames: make(map[string][][]byte)}
-
-func VideoGroupKey(info domain.VideoInfo) string {
-	return DigestBytes([]byte(fmt.Sprintf("%d:%d:%d:%d:%d:%s",
-		info.Width, info.Height, info.FPSNum, info.FPSDen, info.FrameCount, info.Chroma)))
-}
-
-func copyVideoFrames(frames [][]byte) [][]byte {
-	result := make([][]byte, len(frames))
-	for i := range frames {
-		result[i] = append([]byte(nil), frames[i]...)
-	}
-	return result
-}
-
-func rememberVideoFrames(info domain.VideoInfo, frames [][]byte) [][]byte {
-	key := VideoGroupKey(info)
-	videoFrameCache.Lock()
-	defer videoFrameCache.Unlock()
-	previous, found := videoFrameCache.frames[key]
-	if !found && len(videoFrameCache.frames) >= 8 {
-		videoFrameCache.frames = make(map[string][][]byte)
-	}
-	videoFrameCache.frames[key] = copyVideoFrames(frames)
-	if found {
-		return copyVideoFrames(previous)
-	}
-	return frames
 }
 
 type parsedHeader struct {
@@ -111,7 +77,7 @@ func InspectVideo(data []byte) (VideoClip, error) {
 		Digest:     DigestBytes(data),
 		ByteCount:  len(data),
 	}
-	return VideoClip{Info: info, Frames: rememberVideoFrames(info, frames)}, nil
+	return VideoClip{Info: info, Frames: frames}, nil
 }
 
 func parseY4MHeader(line string) (parsedHeader, error) {
